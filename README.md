@@ -112,6 +112,34 @@ maxfps=60
 
 ---
 
+### 4. D3D11/DXVK Game Overlay Stub (`shims/gameoverlay64_stub.c`)
+
+**Root cause:** 64-bit games using DXVK (e.g. Unity 6 games with bundled DXVK) crash with a page fault in `dxgi.dll`. Steam's `steam_api64.dll` loads `GameOverlayRenderer64.dll` via hardcoded full path and hooks `IDXGISwapChain::Present`. On Wine + DXVK, this hook corrupts the swap chain, causing an immediate crash: `page fault on read access to 0x0000000000000020` in dxgi.
+
+Setting `GameOverlayRenderer64.dll=d` in WINEDLLOVERRIDES does not work because `=d` does not intercept full-path `LoadLibraryA` calls. The `=b` flag forces Wine's builtin search first, which does intercept it.
+
+**Fix:** Compile a 64-bit stub `GameOverlayRenderer64.dll` that exports all 13 expected functions as no-ops. Place it in Wine's x86_64-windows builtin directory and set `GameOverlayRenderer64.dll=b` in WINEDLLOVERRIDES.
+
+**Build:**
+```bash
+x86_64-w64-mingw32-gcc -O2 -shared -o GameOverlayRenderer64.dll shims/gameoverlay64_stub.c
+```
+
+**Install:**
+```bash
+WINE_X64="$HOME/Library/Application Support/<your-bottle>/../Wine/Contents/Resources/wine/lib/wine/x86_64-windows"
+cp GameOverlayRenderer64.dll "$WINE_X64/GameOverlayRenderer64.dll"
+```
+
+Then add to `WINEDLLOVERRIDES`:
+```
+GameOverlayRenderer64.dll=b
+```
+
+Note: if the game ships its own DXVK (common for Unity games), also set `dxgi=n,b;d3d11=n,b;d3d10core=n,b` so Wine loads the game's bundled DXVK instead of wined3d. If the bundled DXVK is old and doesn't support `D3D_FEATURE_LEVEL_11_1`, replace it with DXVK 3.0 (download `dxvk-X.X.tar.gz` from the DXVK GitHub releases and copy `x64/d3d11.dll`, `x64/dxgi.dll`, `x64/d3d10core.dll` into the game directory).
+
+---
+
 ## Required Wine Environment
 
 These env vars are needed for Steam + games to work:
@@ -135,9 +163,9 @@ Steam.exe -no-cef-sandbox -forcedesktopscaling 1 -noverifyfiles
 | Game type | Renderer | Notes |
 |---|---|---|
 | DirectDraw (old 2D games) | cnc-ddraw + OpenGL | Use gameoverlay_stub + `ddraw=n,b;GameOverlayRenderer.dll=b` in WINEDLLOVERRIDES |
-| Unity (D3D11) | DXVK if bundled | Some Unity games ship their own DXVK; use `d3d11=n,b` in WINEDLLOVERRIDES |
+| Unity 6 / D3D11 (64-bit) | DXVK 3.0 | Replace bundled DXVK if old; use gameoverlay64_stub + `GameOverlayRenderer64.dll=b;dxgi=n,b;d3d11=n,b` |
 | D3D9 games | Auto (wined3d) | Generally works |
-| D3D11/D3D12 games | DXVK if bundled | Use `d3d11=n,b` in WINEDLLOVERRIDES to load the game's own DXVK |
+| D3D11/D3D12 games (other) | DXVK if bundled | Use `d3d11=n,b;d3d10core=n,b` in WINEDLLOVERRIDES to load the game's own DXVK |
 
 ---
 
