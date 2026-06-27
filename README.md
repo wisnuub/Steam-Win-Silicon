@@ -10,6 +10,19 @@ Tested on: M1 MacBook, macOS 15, Wine 11.10 (GPTK), Steam build ~1782257239.
 
 ---
 
+## Tested / Playable Games
+
+Games confirmed working on M1 Mac with this setup. All tested via [Aether](https://github.com/wisnuub/Aether).
+
+| Game | App ID | Engine | Renderer | Required Fixes | Notes |
+|------|--------|--------|----------|---------------|-------|
+| [Taskbar Hero](https://store.steampowered.com/app/3678970) | 3678970 | Unity 6 | MoltenVK wrapper | moltenvk_wrap.c v13, gameoverlay64_stub, DirectComposition enabled | Transparent taskbar overlay idle game; DComp required for transparency |
+| [Plants vs. Zombies GOTY](https://store.steampowered.com/app/3590) | 3590 | PopCap | cnc-ddraw + D3D9 | gameoverlay_stub, cnc-ddraw (renderer=opengl) | Classic 2D DDraw game; no d3d11 needed |
+
+The easiest way to run these is **[Aether](https://github.com/wisnuub/Aether)** -- a macOS launcher that applies all the fixes automatically per-game.
+
+---
+
 ## The Problem
 
 Running Windows Steam through Wine on Apple Silicon hits several rendering bugs:
@@ -170,21 +183,6 @@ Steam.exe -no-cef-sandbox -forcedesktopscaling 1 -noverifyfiles
 | Unity 6 / D3D11 (64-bit) | DXVK 3.0 | Replace bundled DXVK if old; use gameoverlay64_stub + `GameOverlayRenderer64.dll=b;dxgi=n,b;d3d11=n,b` |
 | D3D9 games | Auto (wined3d) | Generally works |
 | D3D11/D3D12 games (other) | DXVK if bundled | Use `d3d11=n,b;d3d10core=n,b` in WINEDLLOVERRIDES to load the game's own DXVK |
-
----
-
-## Tested / Playable Games
-
-Games confirmed working on M1 Mac with this setup. All tested via [Aether](https://github.com/wisnuub/Aether).
-
-| Game | App ID | Engine | Renderer | Required Fixes | Notes |
-|------|--------|--------|----------|---------------|-------|
-| [Taskbar Hero](https://store.steampowered.com/app/3678970) | 3678970 | Unity 6 | MoltenVK wrapper | moltenvk_wrap.c v13, gameoverlay64_stub, DirectComposition enabled | Transparent taskbar overlay idle game; DComp required for transparency |
-| [Plants vs. Zombies GOTY](https://store.steampowered.com/app/3590) | 3590 | PopCap | cnc-ddraw + D3D9 | gameoverlay_stub, cnc-ddraw (renderer=opengl) | Classic 2D DDraw game; no d3d11 needed |
-
-### How to run these games
-
-The easiest way is to use **[Aether](https://github.com/wisnuub/Aether)** -- a macOS launcher that applies all these fixes automatically per-game. Manual setup for each game is documented in the fixes above.
 
 ---
 
