@@ -1,6 +1,8 @@
 # Steam-Win-Silicon
 
-Patches and shims to get Steam (Windows) running well on Apple Silicon (M1/M2/M3) via Wine/GPTK.
+Run Windows Steam games on Apple Silicon (M1/M2/M3) Macs via Wine/GPTK -- patches and shims that fix the common rendering failures.
+
+> **Keywords:** steam on mac m1, windows games on apple silicon, wine macos apple silicon, game porting toolkit games, play steam games mac m1, gptk wine moltenvk fix, windows games m1 mac, steam windows mac silicon
 
 Tested on: M1 MacBook, macOS 15, Wine 11.10 (GPTK), Steam build ~1782257239.
 
@@ -166,6 +168,21 @@ Steam.exe -no-cef-sandbox -forcedesktopscaling 1 -noverifyfiles
 | Unity 6 / D3D11 (64-bit) | DXVK 3.0 | Replace bundled DXVK if old; use gameoverlay64_stub + `GameOverlayRenderer64.dll=b;dxgi=n,b;d3d11=n,b` |
 | D3D9 games | Auto (wined3d) | Generally works |
 | D3D11/D3D12 games (other) | DXVK if bundled | Use `d3d11=n,b;d3d10core=n,b` in WINEDLLOVERRIDES to load the game's own DXVK |
+
+---
+
+## Tested / Playable Games
+
+Games confirmed working on M1 Mac with this setup. All tested via [Aether](https://github.com/wisnuub/Aether).
+
+| Game | App ID | Engine | Renderer | Required Fixes | Notes |
+|------|--------|--------|----------|---------------|-------|
+| [Taskbar Hero](https://store.steampowered.com/app/3678970) | 3678970 | Unity 6 | MoltenVK wrapper | moltenvk_wrap.c v13, gameoverlay64_stub, DirectComposition enabled | Transparent taskbar overlay idle game; DComp required for transparency |
+| [Plants vs. Zombies GOTY](https://store.steampowered.com/app/3590) | 3590 | PopCap | cnc-ddraw + D3D9 | gameoverlay_stub, cnc-ddraw (renderer=opengl) | Classic 2D DDraw game; no d3d11 needed |
+
+### How to run these games
+
+The easiest way is to use **[Aether](https://github.com/wisnuub/Aether)** -- a macOS launcher that applies all these fixes automatically per-game. Manual setup for each game is documented in the fixes above.
 
 ---
 

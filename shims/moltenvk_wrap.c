@@ -1,5 +1,5 @@
 /*
- * MoltenVK wrapper v10 for Aether/Steam/CEF on Apple Silicon.
+ * MoltenVK wrapper v13 for Aether/Steam/CEF on Apple Silicon.
  *
  * Fixes:
  * 1. Hides VK_EXT/KHR_buffer_device_address so ANGLE's VMA never uses BDA mode.
@@ -11,6 +11,19 @@
  *    then copy the shadow back into the newly acquired image before returning to ANGLE.
  *    v9: supports up to MAX_SLOTS swapchains simultaneously (fixes dropdown/popup
  *    swapchains clobbering the main window's shadow state in v8).
+ * 4. (v11) Fakes VK_EXT_depth_clip_enable for DXVK 1.10.3 compatibility.
+ *    Apple Metal has no depth-clip-disable, so MoltenVK never advertises this
+ *    extension.  DXVK 1.10.3 marks it as required for device creation and fails
+ *    without it.  We add it to the advertised list, report depthClipEnable=TRUE
+ *    in vkGetPhysicalDeviceFeatures2, and strip it from vkCreateDevice so MoltenVK
+ *    never sees the unsupported request.  Pipelines that try to use it get the
+ *    default Metal behaviour (depth clipping always enabled), which is correct for
+ *    virtually all games.
+ * 5. (v13) Masks pEnabledFeatures against vkGetPhysicalDeviceFeatures at device
+ *    creation time.  winevulkan.so (Wine's Vulkan layer) can pass feature flags
+ *    that MoltenVK rejects with VK_ERROR_FEATURE_NOT_PRESENT even though it may
+ *    have inconsistently reported them as available.  Masking with the real
+ *    supported set ensures we never request an unsupported feature.
  */
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
@@ -28,6 +41,9 @@ static PFN_vkGetPhysicalDeviceFeatures2          real_getFeatures2;
 static PFN_vkBindImageMemory                     real_bindImage;
 static PFN_vkBindImageMemory2                    real_bindImage2;
 static PFN_vkGetImageMemoryRequirements          real_getImgMemReqs;
+/* ---- v11: depth_clip_enable fake ---- */
+static PFN_vkCreateDevice                        real_createDevice;
+static PFN_vkGetPhysicalDeviceFeatures           real_getPhysDevFeats;
 static PFN_vkGetImageMemoryRequirements2         real_getImgMemReqs2;
 
 /* ---- v9: shadow buffer function pointers ---- */
@@ -312,13 +328,15 @@ static void mvk_wrap_init(void) {
     SYM(real_createImage,     CreateImage);
     SYM(real_destroyImage,    DestroyImage);
     SYM(real_freeMemory,      FreeMemory);
+    SYM(real_createDevice,      CreateDevice);
+    SYM(real_getPhysDevFeats,   GetPhysicalDeviceFeatures);
 #undef SYM
 
     char dbgpath[64];
     snprintf(dbgpath, sizeof(dbgpath), "/tmp/mvk_wrap_%d.txt", (int)getpid());
     FILE *dbg = fopen(dbgpath, "w");
     if (dbg) {
-        fprintf(dbg, "mvk_wrap v10 pid=%d path=%s real=%p\n"
+        fprintf(dbg, "mvk_wrap v12 pid=%d path=%s real=%p\n"
                      "gpa=%p createSwap=%p acquireNext=%p queuePresent=%p\n",
                 (int)getpid(), abs_path, real,
                 real_gpa, real_createSwapchain, real_acquireNext, real_queuePresent);
@@ -334,9 +352,12 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
         VkPhysicalDevice physDev, const char *pLayerName,
         uint32_t *pPropertyCount, VkExtensionProperties *pProperties) {
     if (!real_enumDevExts) return VK_ERROR_INITIALIZATION_FAILED;
+    { char p[80]; snprintf(p, sizeof(p), "/tmp/mvk_wrap_%d.txt", (int)getpid());
+      FILE *f = fopen(p, "a"); if (f) { fprintf(f, "ENUM_EXT called pProps=%p\n", pProperties); fclose(f); } }
     VkResult r = real_enumDevExts(physDev, pLayerName, pPropertyCount, pProperties);
     if (r == VK_SUCCESS && pProperties) {
         uint32_t src = 0, dst = 0;
+        int hasDepthClip = 0;
         for (; src < *pPropertyCount; src++) {
             if (strcmp(pProperties[src].extensionName, "VK_EXT_buffer_device_address") == 0) continue;
             if (strcmp(pProperties[src].extensionName, "VK_KHR_buffer_device_address") == 0) continue;
@@ -344,7 +365,21 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
              * causing the Store page content layer to render black. Hide it so ANGLE uses
              * its traditional MSAA fallback path instead. */
             if (strcmp(pProperties[src].extensionName, "VK_EXT_multisampled_render_to_single_sampled") == 0) continue;
+            if (strcmp(pProperties[src].extensionName, "VK_EXT_depth_clip_enable") == 0) hasDepthClip = 1;
             if (src != dst) pProperties[dst] = pProperties[src];
+            dst++;
+        }
+        /* DXVK 1.10.3 requires VK_EXT_depth_clip_enable for device creation.
+         * MoltenVK/Metal has no native depth-clip-disable, so it never advertises
+         * this extension.  We fake it here: report it as present, claim the feature
+         * is supported, and strip it from vkCreateDevice so MoltenVK never errors.
+         * The resulting pipelines use Metal's default (depth clip always on), which
+         * is what D3D11 games expect anyway. */
+        if (!hasDepthClip) {
+            memset(&pProperties[dst], 0, sizeof(pProperties[dst]));
+            strncpy(pProperties[dst].extensionName, "VK_EXT_depth_clip_enable",
+                    VK_MAX_EXTENSION_NAME_SIZE - 1);
+            pProperties[dst].specVersion = 1;
             dst++;
         }
         *pPropertyCount = dst;
@@ -352,12 +387,22 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(
     return r;
 }
 
-VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
-        VkPhysicalDevice physDev, VkPhysicalDeviceFeatures2 *pFeatures) {
-    if (!real_getFeatures2) return;
-    real_getFeatures2(physDev, pFeatures);
+/* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT = 1000102000 */
+#define STYPE_DEPTH_CLIP_ENABLE_FEATURES 1000102000u
+typedef struct {
+    VkStructureType sType;
+    void           *pNext;
+    VkBool32        depthClipEnable;
+} DepthClipEnableFeatures;
+
+static void features2_fixup(VkPhysicalDeviceFeatures2 *pFeatures) {
+    FILE *dlog = fopen("/tmp/dce_features.log", "a");
+    if (dlog) fprintf(dlog, "pid=%d features2_fixup called pNext=%p\n",
+                      (int)getpid(), pFeatures->pNext);
+    int foundDCE = 0;
     VkBaseOutStructure *s = (VkBaseOutStructure *)pFeatures->pNext;
     while (s) {
+        if (dlog) fprintf(dlog, "  sType=%u\n", (unsigned)s->sType);
         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT) {
             VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *f =
                 (VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *)s;
@@ -375,8 +420,38 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
             f->bufferDeviceAddress = f->bufferDeviceAddressCaptureReplay =
             f->bufferDeviceAddressMultiDevice = VK_FALSE;
         }
+        /* Fake VK_EXT_depth_clip_enable support: Metal always clips, which is
+         * what D3D11 games expect, so reporting TRUE is accurate. */
+        if (s->sType == STYPE_DEPTH_CLIP_ENABLE_FEATURES) {
+            DepthClipEnableFeatures *f = (DepthClipEnableFeatures *)s;
+            if (dlog) fprintf(dlog, "  -> found DCE struct, was=%d, setting TRUE\n",
+                              (int)f->depthClipEnable);
+            f->depthClipEnable = VK_TRUE;
+            foundDCE = 1;
+        }
         s = s->pNext;
     }
+    if (dlog) {
+        fprintf(dlog, "  foundDCE=%d\n", foundDCE);
+        fclose(dlog);
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
+        VkPhysicalDevice physDev, VkPhysicalDeviceFeatures2 *pFeatures) {
+    /* Append to the init log to prove this function is entered at all */
+    { char p[80]; snprintf(p, sizeof(p), "/tmp/mvk_wrap_%d.txt", (int)getpid());
+      FILE *f = fopen(p, "a"); if (f) { fprintf(f, "FEATURES2 real=%p\n", real_getFeatures2); fclose(f); } }
+    if (!real_getFeatures2) return;
+    real_getFeatures2(physDev, pFeatures);
+    features2_fixup(pFeatures);
+}
+
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2KHR(
+        VkPhysicalDevice physDev, VkPhysicalDeviceFeatures2 *pFeatures) {
+    if (!real_getFeatures2) return;
+    real_getFeatures2(physDev, pFeatures);
+    features2_fixup(pFeatures);
 }
 
 VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(
@@ -435,6 +510,73 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
         }
     }
     return real_allocMem(device, &localInfo, pAllocator, pMem);
+}
+
+/* Strip VK_EXT_depth_clip_enable and its feature struct, then mask pEnabledFeatures
+ * against what MoltenVK actually supports. This fixes two issues in one pass:
+ *
+ * 1. DCE: we fake the extension in EnumerateDeviceExtensionProperties / GetFeatures2
+ *    so DXVK 1.10.3 can probe D3D_FEATURE_LEVEL_11_1, but MoltenVK rejects it at
+ *    vkCreateDevice time -- so strip it here before calling real_createDevice.
+ *
+ * 2. Feature mask: winevulkan.so (Wine's Vulkan layer) sends pEnabledFeatures with
+ *    features set to TRUE that MoltenVK will not accept at device creation, even
+ *    though MoltenVK itself may have reported them inconsistently.  We query the
+ *    actual supported set and AND the requested features against it so we never
+ *    ask for more than what is available. */
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(
+        VkPhysicalDevice physDev, const VkDeviceCreateInfo *pCI,
+        const VkAllocationCallbacks *pAlloc, VkDevice *pDevice) {
+    if (!real_createDevice) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* Strip VK_EXT_depth_clip_enable from extension list */
+    const char **newExts = malloc(pCI->enabledExtensionCount * sizeof(char *));
+    if (!newExts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    uint32_t newCnt = 0;
+    for (uint32_t i = 0; i < pCI->enabledExtensionCount; i++) {
+        if (strcmp(pCI->ppEnabledExtensionNames[i], "VK_EXT_depth_clip_enable") == 0) continue;
+        newExts[newCnt++] = pCI->ppEnabledExtensionNames[i];
+    }
+
+    /* Strip VkPhysicalDeviceDepthClipEnableFeaturesEXT from pNext chain */
+    void *newNext = NULL;
+    void **prevPtr = &newNext;
+    const VkBaseInStructure *node = (const VkBaseInStructure *)pCI->pNext;
+    while (node) {
+        if ((uint32_t)node->sType != STYPE_DEPTH_CLIP_ENABLE_FEATURES) {
+            *prevPtr = (void *)node;
+            prevPtr = (void **)&((VkBaseOutStructure *)node)->pNext;
+        }
+        node = node->pNext;
+    }
+    *prevPtr = NULL;
+
+    /* Mask pEnabledFeatures against what MoltenVK actually accepts.
+     * winevulkan.so can pass features that MoltenVK doesn't truly support,
+     * causing VK_ERROR_FEATURE_NOT_PRESENT (-8).  Querying the supported set
+     * and ANDing is safe: DXVK already uses whatever features2 reported, and
+     * masking extras to 0 just avoids the rejection. */
+    VkPhysicalDeviceFeatures supportedFeats = {0};
+    VkPhysicalDeviceFeatures maskedFeats    = {0};
+    if (pCI->pEnabledFeatures && real_getPhysDevFeats) {
+        real_getPhysDevFeats(physDev, &supportedFeats);
+        const VkBool32 *req = (const VkBool32 *)pCI->pEnabledFeatures;
+        const VkBool32 *sup = (const VkBool32 *)&supportedFeats;
+        VkBool32 *dst       = (VkBool32 *)&maskedFeats;
+        for (int i = 0; i < (int)(sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32)); i++)
+            dst[i] = req[i] & sup[i];
+    }
+
+    VkDeviceCreateInfo localCI = *pCI;
+    localCI.enabledExtensionCount   = newCnt;
+    localCI.ppEnabledExtensionNames = (const char *const *)newExts;
+    localCI.pNext                   = newNext;
+    if (pCI->pEnabledFeatures && real_getPhysDevFeats)
+        localCI.pEnabledFeatures = &maskedFeats;
+
+    VkResult r = real_createDevice(physDev, &localCI, pAlloc, pDevice);
+    free(newExts);
+    return r;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(
@@ -571,15 +713,22 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(
         VkInstance instance, const char *pName) {
     if (pName) {
+        /* Log every GPA call so we can see what Wine actually requests */
+        if (strstr(pName, "Features") || strstr(pName, "Device") || strstr(pName, "depth") || strstr(pName, "depth_clip")) {
+            FILE *gpalog = fopen("/tmp/dce_gpa.log", "a");
+            if (gpalog) { fprintf(gpalog, "gpa: inst=%p name=%s\n", (void*)instance, pName); fclose(gpalog); }
+        }
         INTERCEPT(vkAllocateMemory)
         INTERCEPT(vkEnumerateDeviceExtensionProperties)
         INTERCEPT(vkGetPhysicalDeviceFeatures2)
+        INTERCEPT(vkGetPhysicalDeviceFeatures2KHR)
         INTERCEPT(vkBindImageMemory)
         INTERCEPT(vkBindImageMemory2)
         INTERCEPT(vkGetImageMemoryRequirements)
         if (strcmp(pName, "vkGetImageMemoryRequirements2") == 0 ||
             strcmp(pName, "vkGetImageMemoryRequirements2KHR") == 0)
             return (PFN_vkVoidFunction)vkGetImageMemoryRequirements2;
+        INTERCEPT(vkCreateDevice)
         INTERCEPT(vkGetDeviceQueue)
         INTERCEPT(vkCreateSwapchainKHR)
         INTERCEPT(vkGetSwapchainImagesKHR)
