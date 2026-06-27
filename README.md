@@ -1,5 +1,7 @@
 # Steam-Win-Silicon
 
+> Started because my wife wanted to play Plants vs. Zombies on her Mac and I refused to accept "it doesn't run on Apple Silicon" as a valid answer.
+
 Run Windows Steam games on Apple Silicon (M1/M2/M3) Macs via Wine/GPTK -- patches and shims that fix the common rendering failures.
 
 > **Keywords:** steam on mac m1, windows games on apple silicon, wine macos apple silicon, game porting toolkit games, play steam games mac m1, gptk wine moltenvk fix, windows games m1 mac, steam windows mac silicon
