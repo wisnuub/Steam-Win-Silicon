@@ -1,5 +1,5 @@
 /*
- * MoltenVK wrapper v13 for Aether/Steam/CEF on Apple Silicon.
+ * MoltenVK wrapper v14 for Aether/Steam/CEF on Apple Silicon.
  *
  * Fixes:
  * 1. Hides VK_EXT/KHR_buffer_device_address so ANGLE's VMA never uses BDA mode.
@@ -7,10 +7,17 @@
  * 3. Shadow buffer content preservation: CAMetalLayer drawables rotate and come
  *    back with undefined content. Chrome's compositor assumes the previous frame
  *    is still in the swapchain image for partial redraws (damage tracking). Fix:
- *    copy the presented image to a per-swapchain shadow VkImage before each present,
- *    then copy the shadow back into the newly acquired image before returning to ANGLE.
+ *    copy the presented image to a shadow VkImage before each present, then copy
+ *    the shadow back into the newly acquired image before returning to ANGLE.
  *    v9: supports up to MAX_SLOTS swapchains simultaneously (fixes dropdown/popup
  *    swapchains clobbering the main window's shadow state in v8).
+ *    v14: shadow state moved from one-per-swapchain to one-per-swap-image-index.
+ *    A swapchain with N images rotates through N independent buffers, each with
+ *    its own drawing history; a single shared shadow restores the wrong frame's
+ *    content into 2-out-of-3 (or 1-out-of-2) acquisitions, which read as icons/UI
+ *    flickering between rendered and stale on every other frame. Also switched
+ *    slot eviction (MAX_SLOTS=64, up from 32) from always-evict-slot-0 to LRU,
+ *    since a real session was observed creating 34 concurrent swapchains.
  * 4. (v11) Fakes VK_EXT_depth_clip_enable for DXVK 1.10.3 compatibility.
  *    Apple Metal has no depth-clip-disable, so MoltenVK never advertises this
  *    extension.  DXVK 1.10.3 marks it as required for device creation and fails
@@ -73,28 +80,44 @@ static VkQueue   g_queue        = VK_NULL_HANDLE;
 static uint32_t  g_queueFamily  = UINT32_MAX;
 
 /* ---- per-swapchain shadow state ---- */
-#define MAX_SLOTS 32
+/* Steam's CEF UI can have 30+ live surfaces at once (main window, popups,
+ * notification toasts, tooltips, overlay). v14: bumped from 32 -> 64 after
+ * observing a real session hit 34 concurrent swapchains, which silently
+ * evicted an in-use slot and caused visible flicker (see LRU eviction below). */
+#define MAX_SLOTS 64
 #define MAX_IMAGES 8
 
+/* v14: shadow state is tracked PER SWAP IMAGE, not per swapchain. A swapchain
+ * with N images (double/triple buffering) rotates through N distinct buffers;
+ * each holds its OWN last-drawn content. A single shadow shared across all N
+ * images restores whichever frame was presented most recently into whatever
+ * image gets acquired next, which is only correct 1-in-N times. The other
+ * (N-1)/N acquisitions silently show a stale/wrong-generation frame, which
+ * reads as rendered content flickering in and out on a regular cadence. */
 typedef struct {
     VkSwapchainKHR  swapchain;
     VkFormat        format;
     uint32_t        width, height;
     VkImage         images[MAX_IMAGES];
     uint32_t        imageCount;
-    VkImage         shadow;
-    VkDeviceMemory  shadowMem;
+    VkImage         shadow[MAX_IMAGES];
+    VkDeviceMemory  shadowMem[MAX_IMAGES];
+    int             shadowReady[MAX_IMAGES];
     VkCommandPool   pool;
     VkCommandBuffer cmd;
-    int             shadowReady;
     int             valid;
+    uint64_t        lastUsed;
 } SwapSlot;
 
 static SwapSlot g_slots[MAX_SLOTS];
+static uint64_t g_slotClock = 0;
 
 static SwapSlot *slot_find(VkSwapchainKHR sw) {
     for (int i = 0; i < MAX_SLOTS; i++)
-        if (g_slots[i].valid && g_slots[i].swapchain == sw) return &g_slots[i];
+        if (g_slots[i].valid && g_slots[i].swapchain == sw) {
+            g_slots[i].lastUsed = ++g_slotClock;
+            return &g_slots[i];
+        }
     return NULL;
 }
 
@@ -104,9 +127,25 @@ static SwapSlot *slot_alloc(VkSwapchainKHR sw) {
     if (s) return s;
     /* Find a free slot */
     for (int i = 0; i < MAX_SLOTS; i++)
-        if (!g_slots[i].valid) { memset(&g_slots[i], 0, sizeof(g_slots[i])); return &g_slots[i]; }
-    /* All slots full: evict slot 0 (oldest) */
-    return &g_slots[0];
+        if (!g_slots[i].valid) {
+            memset(&g_slots[i], 0, sizeof(g_slots[i]));
+            g_slots[i].lastUsed = ++g_slotClock;
+            return &g_slots[i];
+        }
+    /* All slots full: evict the least-recently-used slot, not always slot 0.
+     * Evicting an actively-used swapchain drops its shadow content, causing
+     * a visible blank flash on its next present -- LRU minimizes the chance
+     * we evict something still on screen. */
+    int lru = 0;
+    for (int i = 1; i < MAX_SLOTS; i++)
+        if (g_slots[i].lastUsed < g_slots[lru].lastUsed) lru = i;
+    FILE *log = fopen("/tmp/mvk_shadow.log", "a");
+    if (log) {
+        fprintf(log, "pid=%d SLOT EVICTION: all %d slots full, evicting slot %d (sw=%p) for new sw=%p\n",
+                (int)getpid(), MAX_SLOTS, lru, (void*)g_slots[lru].swapchain, (void*)sw);
+        fclose(log);
+    }
+    return &g_slots[lru];
 }
 
 /* ================================================================
@@ -114,26 +153,44 @@ static SwapSlot *slot_alloc(VkSwapchainKHR sw) {
  * ================================================================ */
 
 static void slot_destroy_shadow(SwapSlot *s, VkDevice dev) {
-    if (s->pool   != VK_NULL_HANDLE && real_destroyCmdPool)
+    if (s->pool != VK_NULL_HANDLE && real_destroyCmdPool)
         real_destroyCmdPool(dev, s->pool, NULL);
-    if (s->shadow != VK_NULL_HANDLE && real_destroyImage)
-        real_destroyImage(dev, s->shadow, NULL);
-    if (s->shadowMem != VK_NULL_HANDLE && real_freeMemory)
-        real_freeMemory(dev, s->shadowMem, NULL);
-    s->pool       = VK_NULL_HANDLE;
-    s->cmd        = VK_NULL_HANDLE;
-    s->shadow     = VK_NULL_HANDLE;
-    s->shadowMem  = VK_NULL_HANDLE;
-    s->shadowReady = 0;
+    for (uint32_t i = 0; i < MAX_IMAGES; i++) {
+        if (s->shadow[i] != VK_NULL_HANDLE && real_destroyImage)
+            real_destroyImage(dev, s->shadow[i], NULL);
+        if (s->shadowMem[i] != VK_NULL_HANDLE && real_freeMemory)
+            real_freeMemory(dev, s->shadowMem[i], NULL);
+        s->shadow[i]      = VK_NULL_HANDLE;
+        s->shadowMem[i]   = VK_NULL_HANDLE;
+        s->shadowReady[i] = 0;
+    }
+    s->pool = VK_NULL_HANDLE;
+    s->cmd  = VK_NULL_HANDLE;
 }
 
-static void slot_setup_shadow(SwapSlot *s, VkDevice dev) {
-    if (s->shadow != VK_NULL_HANDLE) return;
+/* Ensures the command pool/buffer exist (shared across all image indices in
+ * this slot) and allocates the shadow image for one specific index. */
+static void slot_setup_shadow(SwapSlot *s, VkDevice dev, uint32_t idx) {
+    if (idx >= MAX_IMAGES) return;
+    if (s->shadow[idx] != VK_NULL_HANDLE) return;
     if (!real_createImage || !real_allocMem || !real_bindImage) return;
     if (!real_createCmdPool || !real_allocCmdBufs) return;
     if (g_queueFamily == UINT32_MAX) return;
     /* Skip trivial surfaces (1x1 etc.) */
     if (s->width < 4 || s->height < 4) return;
+
+    if (s->pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = g_queueFamily;
+        if (real_createCmdPool(dev, &cpci, NULL, &s->pool) != VK_SUCCESS) return;
+
+        VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cbai.commandPool        = s->pool;
+        cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        real_allocCmdBufs(dev, &cbai, &s->cmd);
+    }
 
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType   = VK_IMAGE_TYPE_2D;
@@ -146,12 +203,12 @@ static void slot_setup_shadow(SwapSlot *s, VkDevice dev) {
     ici.usage       = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (real_createImage(dev, &ici, NULL, &s->shadow) != VK_SUCCESS) {
-        s->shadow = VK_NULL_HANDLE; return;
+    if (real_createImage(dev, &ici, NULL, &s->shadow[idx]) != VK_SUCCESS) {
+        s->shadow[idx] = VK_NULL_HANDLE; return;
     }
 
     VkMemoryRequirements reqs = {0};
-    real_getImgMemReqs(dev, s->shadow, &reqs);
+    real_getImgMemReqs(dev, s->shadow[idx], &reqs);
     uint32_t mt = 0;
     for (uint32_t i = 0; i < 32; i++) {
         if (reqs.memoryTypeBits & (1u << i)) { mt = i; break; }
@@ -159,28 +216,17 @@ static void slot_setup_shadow(SwapSlot *s, VkDevice dev) {
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize  = reqs.size;
     mai.memoryTypeIndex = mt;
-    if (real_allocMem(dev, &mai, NULL, &s->shadowMem) != VK_SUCCESS) {
-        real_destroyImage(dev, s->shadow, NULL);
-        s->shadow = VK_NULL_HANDLE; return;
+    if (real_allocMem(dev, &mai, NULL, &s->shadowMem[idx]) != VK_SUCCESS) {
+        real_destroyImage(dev, s->shadow[idx], NULL);
+        s->shadow[idx] = VK_NULL_HANDLE; return;
     }
-    real_bindImage(dev, s->shadow, s->shadowMem, 0);
-
-    VkCommandPoolCreateInfo cpci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    cpci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpci.queueFamilyIndex = g_queueFamily;
-    if (real_createCmdPool(dev, &cpci, NULL, &s->pool) != VK_SUCCESS) return;
-
-    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    cbai.commandPool        = s->pool;
-    cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    real_allocCmdBufs(dev, &cbai, &s->cmd);
+    real_bindImage(dev, s->shadow[idx], s->shadowMem[idx], 0);
 
     FILE *log = fopen("/tmp/mvk_shadow.log", "a");
     if (log) {
-        fprintf(log, "slot_setup pid=%d sw=%p fmt=%d %ux%u shadow=%p\n",
-                (int)getpid(), (void*)s->swapchain, s->format,
-                s->width, s->height, (void*)s->shadow);
+        fprintf(log, "slot_setup pid=%d sw=%p idx=%u fmt=%d %ux%u shadow=%p\n",
+                (int)getpid(), (void*)s->swapchain, idx, s->format,
+                s->width, s->height, (void*)s->shadow[idx]);
         fclose(log);
     }
 }
@@ -336,7 +382,7 @@ static void mvk_wrap_init(void) {
     snprintf(dbgpath, sizeof(dbgpath), "/tmp/mvk_wrap_%d.txt", (int)getpid());
     FILE *dbg = fopen(dbgpath, "w");
     if (dbg) {
-        fprintf(dbg, "mvk_wrap v12 pid=%d path=%s real=%p\n"
+        fprintf(dbg, "mvk_wrap v14 pid=%d path=%s real=%p\n"
                      "gpa=%p createSwap=%p acquireNext=%p queuePresent=%p\n",
                 (int)getpid(), abs_path, real,
                 real_gpa, real_createSwapchain, real_acquireNext, real_queuePresent);
@@ -660,19 +706,19 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(
         SwapSlot *s = slot_find(pPI->pSwapchains[sc]);
         if (!s || !s->valid) continue;
 
-        /* Lazily create the shadow on first present */
-        if (s->shadow == VK_NULL_HANDLE) slot_setup_shadow(s, g_device);
-        if (s->shadow == VK_NULL_HANDLE || s->cmd == VK_NULL_HANDLE) continue;
-
         uint32_t idx = pPI->pImageIndices[sc];
-        if (idx >= s->imageCount || s->images[idx] == VK_NULL_HANDLE) continue;
+        if (idx >= s->imageCount || idx >= MAX_IMAGES || s->images[idx] == VK_NULL_HANDLE) continue;
 
-        /* Wait for ANGLE's rendering to finish, then copy presented image → shadow */
+        /* Lazily create this image index's own shadow on its first present */
+        if (s->shadow[idx] == VK_NULL_HANDLE) slot_setup_shadow(s, g_device, idx);
+        if (s->shadow[idx] == VK_NULL_HANDLE || s->cmd == VK_NULL_HANDLE) continue;
+
+        /* Wait for ANGLE's rendering to finish, then copy presented image → its shadow */
         real_queueWaitIdle(queue);
         do_copy(s,
-                s->images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                s->shadow,      VK_IMAGE_LAYOUT_UNDEFINED);
-        s->shadowReady = 1;
+                s->images[idx],  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                s->shadow[idx],  VK_IMAGE_LAYOUT_UNDEFINED);
+        s->shadowReady[idx] = 1;
     }
 
     return real_queuePresent(queue, pPI);
@@ -686,19 +732,21 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return r;
 
     SwapSlot *s = slot_find(swapchain);
-    if (!s || !s->valid || !s->shadowReady) return r;
-    if (s->shadow == VK_NULL_HANDLE || s->cmd == VK_NULL_HANDLE) return r;
-    if (g_queue == VK_NULL_HANDLE) return r;
+    if (!s || !s->valid) return r;
+    if (s->cmd == VK_NULL_HANDLE || g_queue == VK_NULL_HANDLE) return r;
 
     uint32_t idx = *pImageIndex;
-    if (idx >= s->imageCount || s->images[idx] == VK_NULL_HANDLE) return r;
+    if (idx >= s->imageCount || idx >= MAX_IMAGES || s->images[idx] == VK_NULL_HANDLE) return r;
+    /* Only restore this specific image index's OWN last content -- not
+     * whatever any other index in this swapchain last showed. */
+    if (!s->shadowReady[idx] || s->shadow[idx] == VK_NULL_HANDLE) return r;
 
-    /* Copy shadow → acquired image.
+    /* Copy this index's shadow → the image ANGLE just acquired at that index.
      * Use PRESENT_SRC_KHR as old layout (what ANGLE expects after a prior present).
      * After this copy the image is left in PRESENT_SRC_KHR.
      * ANGLE's PRESENT_SRC_KHR→COLOR_ATTACHMENT barrier preserves content on MoltenVK. */
     do_copy(s,
-            s->shadow,       VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            s->shadow[idx],  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             s->images[idx],  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
     return r;

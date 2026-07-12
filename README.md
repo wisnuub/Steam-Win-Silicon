@@ -38,11 +38,15 @@ These are caused by three separate bugs in the Wine + MoltenVK + ANGLE stack on 
 
 ## Fixes
 
-### 1. Steam UI Black Screen (`shims/steamwebhelper_shim.c`)
+### 1. Steam UI Black Screen + Menu/Icon Flicker (`shims/steamwebhelper_shim.c`)
 
-**Root cause:** Wine 11.x uses cross-process `client_surface_present` IPC to deliver rendered frames from the GPU subprocess to the browser process's NSWindow. This silently fails on Apple Silicon, frames are rendered but never displayed.
+**Root cause (black screen):** Wine 11.x uses cross-process `client_surface_present` IPC to deliver rendered frames from the GPU subprocess to the browser process's NSWindow. This silently fails on Apple Silicon, frames are rendered but never displayed.
 
-**Fix:** Replace `steamwebhelper.exe` with a shim that injects `--in-process-gpu` into the CEF command line. This eliminates the cross-process GPU path entirely so Metal composites directly to the NSWindow.
+**Root cause (flicker):** Steam's CEF spawns separate renderer/GPU/utility OS processes, each owning native windows that Wine's macOS driver has to composite together. That cross-process window handoff is where a hide/show race lives: macOS window-server occlusion notifications get translated back into `WM_SHOWWINDOW` messages that Steam's own UI reacts to by re-hiding, producing rapid visible flicker in menus, popups, and icons. Confirmed via Steam's own `webhelper.txt` log, showing a context menu toggling `WasHidden 0/1/0/1` within the same second. This is a window-management race, not a GPU rendering bug, so fixes at the MoltenVK/Vulkan layer (shadow buffers, feature masking, etc.) don't touch it.
+
+**Fix:** Replace `steamwebhelper.exe` with a shim that injects CEF flags via the `AETHER_CEF_FLAGS` environment variable (falls back to a built-in default if unset). Two flag sets, pick based on what you're fixing:
+- `--disable-gpu --single-process` (default): folds CEF's renderer/GPU/utility processes into one, eliminating the cross-process window state that causes the flicker. Steam's own UI renders via CPU instead of GPU (a bit slower to redraw, not a big deal for a store/library UI). Games are unaffected, they launch in their own separate Wine process. Credit to [notpop/steam-on-m1-wine](https://github.com/notpop/steam-on-m1-wine) for this combination.
+- `--use-angle=vulkan --ignore-gpu-blocklist --in-process-gpu`: the original black-screen-only fix. Keeps Steam's UI GPU-accelerated but does not address the flicker.
 
 **Build:**
 ```bash
@@ -60,6 +64,11 @@ chflags uchg "$STEAM/bin/cef/cef.win64/steamwebhelper.exe"
 
 Also add `-noverifyfiles` to your Steam launch args to stop the bootstrapper from reverting the shim.
 
+Override the flags at launch time if needed:
+```bash
+AETHER_CEF_FLAGS="--use-angle=vulkan --ignore-gpu-blocklist --in-process-gpu" wine Steam.exe ...
+```
+
 ---
 
 ### 2. MoltenVK BDA + Shadow Buffer (`shims/moltenvk_wrap.c`)
@@ -70,7 +79,8 @@ Also add `-noverifyfiles` to your Steam launch args to stop the bootstrapper fro
 
 **Fix:** A `dylib` wrapper that sits in front of `libMoltenVK.dylib` and:
 - Strips BDA extension advertisements and feature bits
-- Maintains a per-swapchain shadow image, copies the presented frame into it, then restores it into the next acquired image before returning to ANGLE
+- Maintains a shadow image **per swap-image-index** (not per swapchain), copies the presented image into its own shadow slot, then restores that same index's shadow into it before returning to ANGLE. A swapchain double/triple-buffers across N independent images; sharing one shadow across all of them restores the wrong generation of content into 2-out-of-3 (or 1-out-of-2) acquisitions -- this was misdiagnosed as flicker before the real cause (see Fix 1) was found, but is a real correctness bug in its own right and worth keeping.
+- Tracks up to 64 concurrent swapchains (Steam's CEF UI can have 30+ live surfaces: main window, popups, toasts, tooltips) and evicts least-recently-used on overflow instead of always evicting slot 0, so an active window's shadow state doesn't get silently clobbered
 
 **Build:**
 ```bash
@@ -97,7 +107,7 @@ cp libMoltenVK.dylib "$MVKLIB/libMoltenVK.dylib"
 
 **Root cause:** Old DirectDraw games (e.g. Plants vs Zombies) use `cnc-ddraw` as a ddraw-to-D3D9 bridge. Steam's `steam_api.dll` loads `GameOverlayRenderer.dll` via hardcoded full path and hooks `IDirect3DDevice9::Present`, then calls `Reset()`, which destroys cnc-ddraw's D3D9 surfaces, leaving a white or black window.
 
-**Fix:** Compile a stub `GameOverlayRenderer.dll` that exports all 14 expected functions as no-ops. Place it in Wine's i386-windows builtin directory. Set `GameOverlayRenderer.dll=b` in `WINEDLLOVERRIDES` and Wine's builtin search intercepts even the full-path `LoadLibraryA` call.
+**Fix:** Compile a stub `GameOverlayRenderer.dll` that exports all 14 expected functions as no-ops and replace Steam's copy directly. Wine's `=b` builtin override does not work for MinGW-compiled DLLs (Wine 11+ rejects them as "not a builtin"), so replacing the file at the path Steam loads is the only reliable approach.
 
 **Build:**
 ```bash
@@ -107,14 +117,13 @@ i686-w64-mingw32-gcc -O2 -shared -o GameOverlayRenderer.dll shims/gameoverlay_st
 
 **Install:**
 ```bash
-WINE_I386="$HOME/Library/Application Support/<your-bottle>/../Wine/Contents/Resources/wine/lib/wine/i386-windows"
-cp GameOverlayRenderer.dll "$WINE_I386/GameOverlayRenderer.dll"
+STEAM="$HOME/Library/Application Support/<your-bottle>/drive_c/Program Files (x86)/Steam"
+cp "$STEAM/GameOverlayRenderer.dll" "$STEAM/GameOverlayRenderer_real.dll"  # backup
+cp GameOverlayRenderer.dll "$STEAM/GameOverlayRenderer.dll"
+chflags uchg "$STEAM/GameOverlayRenderer.dll"  # prevent Steam from reverting it
 ```
 
-Then add to `WINEDLLOVERRIDES`:
-```
-GameOverlayRenderer.dll=b
-```
+Add `-noverifyfiles` to your Steam launch args to prevent Steam from reverting it on start.
 
 For the DirectDraw game itself, configure `cnc-ddraw`'s `ddraw.ini`:
 ```ini
@@ -135,7 +144,7 @@ maxfps=60
 
 Setting `GameOverlayRenderer64.dll=d` in WINEDLLOVERRIDES does not work because `=d` does not intercept full-path `LoadLibraryA` calls. The `=b` flag forces Wine's builtin search first, which does intercept it.
 
-**Fix:** Compile a 64-bit stub `GameOverlayRenderer64.dll` that exports all 13 expected functions as no-ops. Place it in Wine's x86_64-windows builtin directory and set `GameOverlayRenderer64.dll=b` in WINEDLLOVERRIDES.
+**Fix:** Compile a 64-bit stub `GameOverlayRenderer64.dll` that exports all 13 expected functions as no-ops and replace Steam's copy directly (same reason as the 32-bit stub -- `=b` doesn't work for MinGW DLLs).
 
 **Build:**
 ```bash
@@ -144,13 +153,10 @@ x86_64-w64-mingw32-gcc -O2 -shared -o GameOverlayRenderer64.dll shims/gameoverla
 
 **Install:**
 ```bash
-WINE_X64="$HOME/Library/Application Support/<your-bottle>/../Wine/Contents/Resources/wine/lib/wine/x86_64-windows"
-cp GameOverlayRenderer64.dll "$WINE_X64/GameOverlayRenderer64.dll"
-```
-
-Then add to `WINEDLLOVERRIDES`:
-```
-GameOverlayRenderer64.dll=b
+STEAM="$HOME/Library/Application Support/<your-bottle>/drive_c/Program Files (x86)/Steam"
+cp "$STEAM/GameOverlayRenderer64.dll" "$STEAM/GameOverlayRenderer64_real.dll"  # backup
+cp GameOverlayRenderer64.dll "$STEAM/GameOverlayRenderer64.dll"
+chflags uchg "$STEAM/GameOverlayRenderer64.dll"
 ```
 
 Note: if the game ships its own DXVK (common for Unity games), also set `dxgi=n,b;d3d11=n,b;d3d10core=n,b` so Wine loads the game's bundled DXVK instead of wined3d. If the bundled DXVK is old and doesn't support `D3D_FEATURE_LEVEL_11_1`, replace it with DXVK 3.0 (download `dxvk-X.X.tar.gz` from the DXVK GitHub releases and copy `x64/d3d11.dll`, `x64/dxgi.dll`, `x64/d3d10core.dll` into the game directory).
@@ -191,3 +197,5 @@ Steam.exe -no-cef-sandbox -forcedesktopscaling 1 -noverifyfiles
 - [Aether](https://github.com/wisnuub/Aether) - macOS launcher app that automates all of the above for Steam PC gaming on Apple Silicon
 - [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw) - DirectDraw wrapper used for old 2D games
 - [GPTK (Game Porting Toolkit)](https://developer.apple.com/games/) - Apple's Wine distribution with Metal D3D translation
+- [notpop/steam-on-m1-wine](https://github.com/notpop/steam-on-m1-wine) - independent Steam-on-Apple-Silicon project; source of the `--disable-gpu --single-process` CEF flag combination used in Fix 1
+- [MelonForAll/vineport](https://github.com/MelonForAll/vineport) - another Wine + GPTK launcher for Steam/Epic on Apple Silicon
